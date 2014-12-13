@@ -17,7 +17,6 @@ if theano.config.mode == 'FAST_COMPILE':
 else:
     mode_without_gpu = theano.compile.mode.get_default_mode().excluding('gpu')
 
-
 def test_get_diagonal_subtensor_view(wrap=lambda a: a):
     x = numpy.arange(20).reshape(5, 4).astype('float32')
     x = wrap(x)

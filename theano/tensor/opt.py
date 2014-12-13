@@ -2389,6 +2389,16 @@ compile.optdb.register('local_inplace_incsubtensor1',
         failure_callback=TopoOptimizer.warn_inplace),
                        60, 'fast_run', 'inplace')  # DEBUG
 
+from theano.tensor.nlinalg import ExtractDiag
+@gof.local_optimizer([ExtractDiag])
+def local_extractdiag_view(node):
+    if isinstance(node.op, ExtractDiag) and not node.op.view:
+        new_op = node.op.__class__(view=True) 
+        new_node = new_op(*node.inputs)
+        return [new_node]
+    return False
+compile.optdb.register('local_extractdiag_view', TopoOptimizer(local_extractdiag_view), 60, 'fast_run', 'inplace')
+
 
 # Register old name
 @register_canonicalize("local_incsubtensor_of_allocs")

@@ -145,6 +145,9 @@ class AllocDiag(Op):
 
     def grad(self, inputs, g_outputs):
         return [extract_diag(g_outputs[0])]
+    
+    def __str__(self):
+        return 'AllocDiag'
 
     def perform(self, node, (x,), (z,)):
         if x.ndim != 1:
@@ -223,7 +226,6 @@ class ExtractDiag(Op):
 
 extract_diag = ExtractDiag()
 #TODO: optimization to insert ExtractDiag with view=True
-
 
 def diag(x):
     """

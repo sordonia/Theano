@@ -1901,7 +1901,6 @@ def tensor_to_cuda(x):
     else:
         return x
 
-
 @register_opt()
 @local_optimizer([nlinalg.ExtractDiag])
 def local_gpu_extract_diagonal(node):

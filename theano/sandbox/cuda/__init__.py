@@ -281,7 +281,6 @@ if cuda_available:
     from . import opt, dnn
     from .rng_curand import CURAND_RandomStreams
 
-
 def use(device,
         force=False,
         default_to_move_computation_to_gpu=True,

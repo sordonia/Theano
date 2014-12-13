@@ -5,7 +5,6 @@ from theano.gof import Op, Apply, TopoOptimizer
 from theano import tensor
 import theano.sandbox.cuda as cuda
 
-
 def get_diagonal_subtensor_view(x, i0, i1):
     """Helper function for DiagonalSubtensor and
     IncDiagonalSubtensor
@@ -17,12 +16,17 @@ def get_diagonal_subtensor_view(x, i0, i1):
     i0 = int(i0)
     i1 = int(i1)
     if x.shape[i0] < x.shape[i1]:
-        raise NotImplementedError('is this allowed?')
+        raise NotImplementedError('Cannot take subdiagonal view if shape[i0] < shape[i1]')
     idx = [slice(None)] * x.ndim
-    idx[i0] = slice(x.shape[i1] - 1, None, None)
+    idx[i0] = slice(0, x.shape[i0] - x.shape[i1] + 1, 1)
+    
+    # Take the original strides. When executing subtensor on gpu the strides change
+    # while on cpu this does not change, why?? 
+    orig_strides = x.view().strides
+    strides = list(orig_strides) 
     xview = x.__getitem__(tuple(idx))
-    strides = list(xview.strides)
-    strides[i1] -= strides[i0]
+    # Increment strides i1 by the number of bytes till the next row = strides[i0]
+    strides[i1] += strides[i0]
     xview.strides = strides
     return xview
 
@@ -72,7 +76,7 @@ class DiagonalSubtensor(Op):
     case it's not clear what this function should do. Maybe always
     raise an error. I'd look back to the call site in the Conv3D to
     see what's necessary at that point.
-
+    
     """
     def __str__(self):
         if self.inplace:
@@ -158,6 +162,25 @@ class IncDiagonalSubtensor(Op):
         return rval
 inc_diagonal_subtensor = IncDiagonalSubtensor(False)
 
+### Optimization for alloc diag
+import numpy
+from theano.tensor.nlinalg import AllocDiag
+@theano.gof.local_optimizer([AllocDiag])
+def local_gpu_alloc_diagonal(node):
+    if (isinstance(node.op, AllocDiag) and
+        isinstance(node.inputs[0].type,
+                   theano.tensor.TensorType)):
+        inp = node.inputs[0]
+        if inp.owner and isinstance(inp.owner.op, cuda.HostFromGpu):
+            diag = inp.owner.inputs[0]
+            y = cuda.gpu_from_host(tensor.alloc(numpy.asarray(0, dtype=diag.dtype), diag.shape[0], diag.shape[0]))
+            y = theano.tensor.nnet.conv3d2d.IncDiagonalSubtensor()(y, 0, 1, diag)
+            return [cuda.host_from_gpu(y)]
+        else:
+            return False
+    return False
+cuda.opt.register_opt()(local_gpu_alloc_diagonal)
+####
 
 def conv3d(signals, filters,
            signals_shape=None, filters_shape=None,
