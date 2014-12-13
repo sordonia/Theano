@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 
 import theano
@@ -131,20 +132,38 @@ AddConfigVar('mode',
                 'FAST_COMPILE', 'PROFILE_MODE', 'DEBUG_MODE'),
         in_c_key=False)
 
-param = StrParam("g++")
+param = "g++"
 
 # Test whether or not g++ is present: disable C code if it is not.
 try:
     rc = call_subprocess_Popen(['g++', '-v'])
 except OSError:
-    param = StrParam("")
+    param = ""
     rc = 1
+
+# On Mac we test for 'clang++' and use it by default
+if sys.platform == 'darwin':
+    try:
+        rc = call_subprocess_Popen(['clang++', '-v'])
+        param = "clang++"
+    except OSError:
+        pass
+
+# Try to find the full compiler path from the name
+if param != "":
+    import distutils.spawn
+    newp = distutils.spawn.find_executable(param)
+    if newp is not None:
+        param = newp
+    del newp
+    del distutils
+
 AddConfigVar('cxx',
              "The C++ compiler to use. Currently only g++ is"
              " supported, but supporting additional compilers should not be "
              "too difficult. "
              "If it is empty, no C++ code is compiled.",
-             param,
+             StrParam(param),
              in_c_key=False)
 del param
 
@@ -440,6 +459,14 @@ AddConfigVar('warn.reduce_join',
               '"Reduce{scalar.op}(Join(axis=0, a, b), axis=0)", '
               'did not check the reduction axis. So if the '
               'reduction axis was not 0, you got a wrong answer.'),
+             BoolParam(warn_default('0.7')),
+             in_c_key=False)
+
+AddConfigVar('warn.inc_set_subtensor1',
+             ('Warn if previous versions of Theano (before 0.7) could have '
+              'given incorrect results for inc_subtensor and set_subtensor '
+              'when using some patterns of advanced indexing (indexing with '
+              'one vector or matrix of ints).'),
              BoolParam(warn_default('0.7')),
              in_c_key=False)
 

@@ -3,6 +3,7 @@ _logger = logging.getLogger('theano.sandbox.cuda.opt')
 
 import copy
 import sys
+import time
 import warnings
 
 import numpy
@@ -13,11 +14,12 @@ from theano import config, tensor, gof
 import theano.ifelse
 
 from theano.compile import optdb
-from theano.gof import (local_optimizer, EquilibriumDB, SequenceDB, ProxyDB,
+from theano.gof import (local_optimizer, EquilibriumDB, ProxyDB,
                         Optimizer, toolbox)
+from theano.gof.opt import LocalMetaOptimizer
 from theano.gof.python25 import all, any
 from theano.sandbox.cuda.basic_ops import (
-    device_properties, gpu_eye, gpu_contiguous,
+    gpu_eye, gpu_contiguous,
     gpu_from_host, host_from_gpu, GpuFromHost, HostFromGpu,
     GpuElemwise, GpuDimShuffle, GpuReshape, GpuCAReduce, GpuFlatten,
     GpuSubtensor, GpuAdvancedSubtensor1,
@@ -42,19 +44,22 @@ from theano.sandbox.cuda.elemwise import SupportCodeError
 from theano.scalar.basic_scipy import Erfinv
 from theano.sandbox.cuda.elemwise import erfinv_gpu
 from theano.sandbox.cuda.var import CudaNdarrayConstant
+from theano.sandbox.cuda import gpu_optimizer, register_opt, gpu_seqopt, GpuOp
 from theano.scan_module import scan_utils, scan_op, scan_opt
 from theano.tensor.blas import _is_real_vector, _is_real_matrix
 from theano.tensor import nlinalg
 from theano.tensor.nnet.Conv3D import Conv3D
 
+try:
+    # We need to be able to import this file even if cuda isn't avail.
+    from theano.sandbox.cuda import device_properties
+except ImportError:
+    pass
+
+
 #optdb.print_summary()  # shows what is currently registered
 
-#ignore_newtrees is to speed the optimization as this is the pattern
-#we use for optimization. Otherwise, we can iterate 100s of time on
-#the graph and apply only a few optimizations each time.
-gpu_optimizer = EquilibriumDB(ignore_newtrees=False)
 gpu_cut_copies = EquilibriumDB()
-gpu_seqopt = SequenceDB()
 gpu_seqopt.register('gpu_local_optimizations', gpu_optimizer, 1,
         'fast_run', 'fast_compile', 'inplace', 'gpu')
 gpu_seqopt.register('gpu_cut_transfers', gpu_cut_copies, 2,
@@ -76,14 +81,6 @@ optdb.register('gpu_after_fusion',
 gpu_optimizer.register('gpu_merge', theano.gof.opt.merge_optimizer,
                        'fast_run', 'fast_compile')
 
-
-def register_opt(*tags, **kwargs):
-    def f(local_opt):
-        name = (kwargs and kwargs.pop('name')) or local_opt.__name__
-        gpu_optimizer.register(name, local_opt, 'fast_run', 'fast_compile',
-                               'gpu', *tags)
-        return local_opt
-    return f
 
 #register local_track_shape_i at this level too
 #to make multi-level lift of shape work.
@@ -835,6 +832,11 @@ def local_gpu_subtensor(node):
            isinstance(host_input.owner.op, tensor.Subtensor):
             subt = host_input.owner.op
             x = host_input.owner.inputs[0]
+            if len(x.clients) == 1:
+                # It mean, the input of the subtensor is used only by
+                # the subtensor. We do not want to move the subtensor
+                # to the GPU in that case.
+                return
             coords = host_input.owner.inputs[1:]
             return [GpuSubtensor(subt.idx_list)(gpu_from_host(x), *coords)]
     if isinstance(node.op, tensor.Subtensor):
@@ -842,6 +844,19 @@ def local_gpu_subtensor(node):
         if (x.owner and
             isinstance(x.owner.op, HostFromGpu) and
             x.dtype == "float32"):
+            gpu_x = x.owner.inputs[0]
+            if (gpu_x.owner and
+                isinstance(gpu_x.owner.op, GpuFromHost) and
+                # And it is a shared var or an input of the graph.
+                not gpu_x.owner.inputs[0].owner):
+                if len(x.clients) == 1:
+                    if any([n == 'output' or isinstance(n.op, GpuOp)
+                            for n,_  in node.outputs[0].clients]):
+                        return
+                    else:
+                        return [host_from_gpu(gpu_from_host(node.outputs[0]))]
+                    return
+
             gpu_x, = x.owner.inputs
             coords = node.inputs[1:]
             return [host_from_gpu(GpuSubtensor(
@@ -1181,6 +1196,7 @@ def local_gpu_conv(node):
                     logical_kern_align_top=op.kshp_logical_top_aligned,
                     kshp=op.kshp,
                     version=op.version,
+                    direction_hint=op.direction_hint,
                     verbose=op.verbose,
                     imshp=op.imshp,
                     nkern=op.nkern,
@@ -1336,13 +1352,71 @@ conv_groupopt.register('conv_fft_full', local_conv_fft_full, 10,
 # cuDNN is the second, but only registered if cuDNN is available.
 # It can be disabled by excluding 'conv_dnn' or 'cudnn'.
 from . import dnn
-if dnn.dnn_available():
-    conv_groupopt.register('conv_dnn', dnn.local_conv_dnn, 20,
-                           'fast_compile', 'fast_run', 'cudnn')
+# We can't check at import if dnn is available, so we must always
+# register it. This do not cause problem as if it is not avail, the
+# opt will do nothing.
+conv_groupopt.register('local_conv_dnn', dnn.local_conv_dnn, 20,
+                       'conv_dnn',
+                       'fast_compile', 'fast_run', 'cudnn')
 # The GEMM-based convolution comes last to catch all remaining cases.
 # It can be disabled by excluding 'conv_gemm'.
-conv_groupopt.register('conv_gemm', local_conv_gemm, 30,
+conv_groupopt.register('local_conv_gemm', local_conv_gemm, 30,
+                       'conv_gemm',
                        'fast_compile', 'fast_run')
+
+
+class LocalCudaMetaOptimizer(LocalMetaOptimizer):
+    """Base class for CUDA-based LocalMetaOptimizers"""
+
+    def time_call(self, fn):
+        # Override time_call() to do device synchronization
+        theano.sandbox.cuda.synchronize()
+        start = time.time()
+        fn()
+        theano.sandbox.cuda.synchronize()
+        return time.time() - start
+
+
+# Convolution Meta-optimizer
+
+class ConvMetaOptimizer(LocalCudaMetaOptimizer):
+    def __init__(self, optimizers):
+        super(ConvMetaOptimizer, self).__init__([GpuConv], optimizers)
+
+    def provide_inputs(self, node, inputs):
+        # We need to provide dummy data for the given inputs.
+        # We can make use of the fact that GpuConv often knows its shapes.
+        result = {}
+        img, kern = node.inputs
+        # provide dummy image and filters if needed
+        vars = (img, kern)
+        if node.op.imshp is not None and len(node.op.imshp) == 3:
+            nchannels = node.op.imshp[0]
+        else:
+            nchannels = None
+        shapes = ((node.op.bsize,) + node.op.imshp,
+                  (node.op.nkern, nchannels) + node.op.kshp)
+        for (var, shape) in zip(vars, shapes):
+            if ((var in inputs) and
+                (shape is not None) and
+                not any(s is None for s in shape)):
+                result[var] = theano.shared(
+# TODO: Use var.type.filter when cuda_ndarray.filter supports non-strict casts
+#                        var.type.filter(numpy.random.randn(*shape),
+#                                        allow_downcast=True),
+                        numpy.require(numpy.random.randn(*shape),
+                                      dtype=var.dtype),
+                        var.name, borrow=True)
+        # return mapping
+        return result
+
+# We just register all optimizers from conv_groupopt with the metaoptimizer
+conv_metaopt = ConvMetaOptimizer(
+        conv_groupopt.query(*['+' + name for name in conv_groupopt._names]).opts)
+# Then we add some optimizers that try less obvious options
+conv_metaopt.register(dnn.local_conv_dnn_alternative)
+# Finally, we register the metaoptimizer as the first optimizer in conv_groupopt
+conv_groupopt.register('conv_meta', conv_metaopt, 0)
 
 
 @local_optimizer([Conv3D])

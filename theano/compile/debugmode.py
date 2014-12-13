@@ -874,8 +874,12 @@ def _lessbroken_deepcopy(a):
     """
     # this exists because copy.deepcopy on numpy arrays is broken
     # This logic is also in link.py
+    from theano.gof.type import CDataType
     if type(a) in (numpy.ndarray, numpy.memmap):
         rval = a.copy()
+    elif type(a) is CDataType._cdata_type:
+        # This is not copyable (and should be used for constant data).
+        rval = a
     else:
         rval = copy.deepcopy(a)
 
@@ -2098,7 +2102,7 @@ class _Linker(gof.link.LocalLinker):
             return deco
 
         f = run_with_tensortype_filter_check(f)
-
+        f.storage_map = storage_map
         f.allow_gc = True
         assert len(fgraph.inputs) == len(input_storage)
         assert len(fgraph.outputs) == len(output_storage)

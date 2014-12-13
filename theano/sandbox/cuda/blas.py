@@ -513,8 +513,9 @@ class BaseGpuCorrMM(GpuOp):
         integers
     :param subsample: perform subsampling of the output (default: (1, 1))
     :param pad: *deprecated*, now you should always use border_mode
-    
+
     """
+    check_broadcast = False
 
     def __init__(self, border_mode="valid", subsample=(1, 1), pad=(0, 0)):
         if pad != (0, 0):
@@ -801,6 +802,26 @@ class BaseGpuCorrMM(GpuOp):
 class GpuCorrMM(BaseGpuCorrMM):
     """GPU correlation implementation using Matrix Multiplication.
 
+    :param border_mode: currently supports "valid" only; "full" can be
+        simulated by setting `pad="full"` (at the cost of performance), or
+        by using `GpuCorrMM_gradInputs`
+    :param subsample: the subsample operation applied to each output image.
+        Should be a tuple with 2 elements.
+        `(sv, sh)` is equivalent to `GpuCorrMM(...)(...)[:,:,::sv, ::sh]`,
+        but faster.
+        Set to `(1, 1)` to disable subsampling.
+    :param pad: the width of a border of implicit zeros to pad the input
+        image with. Should be a tuple with 2 elements giving the numbers of
+        rows and columns to pad on each side, or "half" to set the padding
+        to `(kernel_rows // 2, kernel_columns // 2)`, or "full" to set the
+        padding to `(kernel_rows - 1, kernel_columns - 1)` at runtime.
+        Set to `(0, 0)` to disable padding.
+
+    :note: Currently, the Op requires the inputs, filters and outputs to be
+        C-contiguous. Use :func:`gpu_contiguous
+        <theano.sandbox.cuda.basic_ops.gpu_contiguous>` on these arguments
+        if needed.
+
     :note: You can either enable the Theano flag `optimizer_including=conv_gemm`
         to automatically replace all convolution operations with `GpuCorrMM`
         or one of its gradients, or you can use it as a replacement for
@@ -819,29 +840,8 @@ class GpuCorrMM(BaseGpuCorrMM):
         batchsize or number of filters) may also work around the CUBLAS bug.
     """
     def __init__(self, border_mode="valid",
-            subsample=(1, 1),
-            pad=(0, 0)):
-        """
-        :param border_mode: currently supports "valid" only; "full" can be
-            simulated by setting `pad="full"` (at the cost of performance), or
-            by using `GpuCorrMM_gradInputs`
-        :param subsample: the subsample operation applied to each output image.
-            Should be a tuple with 2 elements.
-            `(sv, sh)` is equivalent to `GpuCorrMM(...)(...)[:,:,::sv, ::sh]`,
-            but faster.
-            Set to `(1, 1)` to disable subsampling.
-        :param pad: the width of a border of implicit zeros to pad the input
-            image with. Should be a tuple with 2 elements giving the numbers of
-            rows and columns to pad on each side, or "half" to set the padding
-            to `(kernel_rows // 2, kernel_columns // 2)`, or "full" to set the
-            padding to `(kernel_rows - 1, kernel_columns - 1)` at runtime.
-            Set to `(0, 0)` to disable padding.
-
-        :note: Currently, the Op requires the inputs, filters and outputs to be
-            C-contiguous. Use :func:`gpu_contiguous
-            <theano.sandbox.cuda.basic_ops.gpu_contiguous>` on these arguments
-            if needed.
-        """
+                 subsample=(1, 1),
+                 pad=(0, 0)):
         super(GpuCorrMM, self).__init__(border_mode, subsample, pad)
 
     def make_node(self, img, kern):
@@ -1499,6 +1499,8 @@ class GpuConv(GpuOp):
     """
     Implement the batched and stacked 2d convolution on the gpu.
     """
+    check_broadcast = False
+
     @staticmethod
     def logical_output_shape_2d(imshp, kshp, mode):
         if mode == 'valid':
@@ -1513,6 +1515,7 @@ class GpuConv(GpuOp):
             logical_kern_hw=None,
             logical_kern_align_top=True,
             version=-1,
+            direction_hint=None,
             verbose=0,
             kshp=None,
             imshp=None,
@@ -1525,6 +1528,10 @@ class GpuConv(GpuOp):
                         convolution. By default we try to guess the best one.
                         You can force one version with this parameter. This
                         parameter is used by the tests.
+        :param direction_hint: 'forward', 'bprop weights' or 'bprop inputs'.
+                        Serves as a hint for graph optimizers replacing
+                        GpuConv by other implementations. If the GpuConv is
+                        inserted automatically, we take its value from ConvOp.
         :param verbose: for value of 1,2 and 3. Print more information during
                         the execution of the convolution. Mostly used for
                         optimization or debugging.
@@ -1570,6 +1577,7 @@ class GpuConv(GpuOp):
         self.logical_kern_hw = logical_kern_hw
         self.logical_kern_align_top = logical_kern_align_top
         self.version = version
+        self.direction_hint = direction_hint
         self.verbose = verbose
         self.kshp = kshp
         self.imshp = imshp
@@ -1597,6 +1605,8 @@ class GpuConv(GpuOp):
             self.imshp = None
         if not hasattr(self, "max_threads_dim0"):
             self.max_threads_dim0 = None
+        if not hasattr(self, "direction_hint"):
+            self.direction_hint = None
 
     def __hash__(self):
         # don't use hash(self.version) as hash(-1)==-2 and

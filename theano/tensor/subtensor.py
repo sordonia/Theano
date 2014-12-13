@@ -15,8 +15,9 @@ from theano.gof import Apply, Constant, hashtype, Op, Type, MethodNotDefined
 from theano.gof.python25 import maxsize
 from theano.printing import pprint
 from theano import scalar as scal
+from theano.tensor.basic import alloc
 from theano.tensor.basic import (addbroadcast, clip, get_scalar_constant_value,
-                                 ARange, TensorType)
+                                 ARange, TensorType, NotScalarConstantError)
 from theano.tensor.elemwise import DimShuffle
 from theano.tensor.type_other import NoneConst, SliceType, make_slice
 from theano import config
@@ -470,15 +471,22 @@ class Subtensor(Op):
         broadcastable = []
         for i, (p, bc) in enumerate(izip(padded, x.type.broadcastable)):
             if isinstance(p, slice):
-                if bc and p.start in [None, 0]:
+                if bc:
                     start = p.start
-                    if start is None:
-                        start = 0
-                    if (p.stop is None or
-                        (isinstance(p.stop, (int, numpy.integer)) and
-                         p.stop > start)):
-                        broadcastable.append(True)
-                        continue
+                    try:
+                        start = get_scalar_constant_value(start)
+                    except NotScalarConstantError:
+                        pass
+                    if start in [None, 0]:
+                        start = p.start
+                        if start is None:
+                            start = 0
+                        if (p.stop is None or
+                            (isinstance(p.stop, (int, numpy.integer,
+                                                 numpy.ndarray)) and
+                             p.stop > start)):
+                            broadcastable.append(True)
+                            continue
 
                 broadcastable.append(False)
 
@@ -1015,8 +1023,8 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
                          "subtensor with a %d-dimensional value.") % (x.ndim,
                                                                       y.ndim))
 
+    dim_offset = x.ndim - y.ndim
     for dim in range(y.ndim):
-        dim_offset = x.ndim - y.ndim
         if (x.broadcastable[dim + dim_offset]
                 and not y.broadcastable[dim]):
             # It is acceptable to try to increment a subtensor with a
@@ -1064,23 +1072,77 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
         # completely, but the problem is that advanced_inc_subtensor1 can only
         # work on the first (outer-most, left-most) dimension of x,
         # just like advanced_subtensor1.
-        # So we call advanced_inc_subtensor1(x.T, i, y), but then we need to
+        # So we call advanced_inc_subtensor1(x.T, i, y.T) (as we also need to
+        # transpose y if it is not a scalar or a vector), but then we need to
         # return something that has the same shape as x, not as x.T (inner_x).
         # So re-apply the outer dimshuffle on the new inc_subtensor,
-        # and return advanced_inc_subtensor1(x.T, i, y).T.
+        # and return advanced_inc_subtensor1(x.T, i, y.T).T.
+
+        # Get the dimshuffle pattern to apply to y.
+        x_order = x.owner.op.new_order
+        y_order = ['x'] * x.ndim
+        for i, v in enumerate(x_order):
+            if v != 'x' and (v - dim_offset) >= 0:
+                y_order[v - dim_offset] = i
+
+        # Warn if this code path would have produced wrong results in the past
+        if config.warn.inc_set_subtensor1:
+            # Dimshuffle pattern for y that would be equivalent to past code
+            prev_y_order = ['x'] * (dim_offset) + list(range(y.ndim))
+            if y_order != prev_y_order:
+                warnings.warn(
+                    'Although your current code is fine, please note that '
+                    'earlier versions prior to 0.7 (or this development '
+                    'version) may have yielded an incorrect result in '
+                    'this `inc_subtensor` or `set_subtensor` operation. '
+                    'To remove this warning, you can either set the '
+                    '`warn.inc_set_subtensor1` config option to `False`, '
+                    'or `warn.ignore_bug_before` to at least "0.7".',
+                    stacklevel=2)
+
         inner_incsubtensor = inc_subtensor(
-            inner_x, y,
+            inner_x,
+            y.dimshuffle(y_order),
             inplace=inplace,
             set_instead_of_inc=set_instead_of_inc,
             tolerate_inplace_aliasing=tolerate_inplace_aliasing)
         return x.owner.op(inner_incsubtensor, *x.owner.inputs[1:])
     elif isinstance(x.owner.op, theano.tensor.Reshape):
+        # This case happens when the indices are not arranged as a vector, but
+        # as a higher-dimensional array. This is handled by the subtensor
+        # by flattening this list, taking the subtensor, then reshaping the
+        # result.
         inner_x = x.owner.inputs[0]
         # Try to apply inc_subtensor on inner_x.
         # If it works, there is no need to reshape, as the inc_subtensor
         # will have the same shape as inner_x, which is what we want.
+        # We also explicitly duplicate y to its broadcasted shape
+        # before we partially flatten it to inner_x dimension. This is
+        # not strictly needed in all cases, but it is easier this way.
+        if y.ndim > 0:
+            # This if is needed to prevent some useless warning about
+            # old code bug.
+            expanded_y = alloc(y, *[x.shape[i] for i in range(x.ndim)])
+            flattened_y = expanded_y.flatten(inner_x.ndim)
+        else:
+            flattened_y = y
+
+        # Warn if this code path would have produced wrong results in the past
+        if config.warn.inc_set_subtensor1:
+            if inner_x.ndim > 1 and sum(y.broadcastable) > 0:
+                warnings.warn(
+                    'Although your current code is fine, please note that '
+                    'earlier versions prior to 0.7 (or this development '
+                    'version) may have yielded an incorrect result in '
+                    'this `inc_subtensor` or `set_subtensor` operation. '
+                    'To remove this warning, you can either set the '
+                    '`warn.inc_set_subtensor1` config option to `False`, '
+                    'or `warn.ignore_bug_before` to at least "0.7".',
+                    stacklevel=2)
+
         inner_incsubtensor = inc_subtensor(
-            inner_x, y.flatten(),
+            inner_x,
+            flattened_y,
             inplace=inplace,
             set_instead_of_inc=set_instead_of_inc,
             tolerate_inplace_aliasing=tolerate_inplace_aliasing)
@@ -1777,9 +1839,14 @@ class AdvancedIncSubtensor1(Op):
         # broadcasted to fill all relevant rows of `x`.
         assert y.ndim <= x.ndim   # Should be guaranteed by `make_node`
         if y.ndim == x.ndim:
-            assert len(y) == len(idx)
-            for (j, i) in enumerate(idx):
-                x[i] += y[j]
+            if len(y) == 1:
+                # Allow broadcasting of y[0]
+                for i in idx:
+                    x[i] += y[0]
+            else:
+                assert len(y) == len(idx)
+                for (j, i) in enumerate(idx):
+                    x[i] += y[j]
         else:
             for i in idx:
                 x[i] += y
@@ -1893,7 +1960,9 @@ class AdvancedSubtensor(Op):
         # Really special case
         if len(ishapes) == 3:
             xshp, ind1shp, ind2shp = ishapes
-            if len(xshp) == 2 and len(ind1shp) == 1 and len(ind2shp) == 1:
+            if (len(xshp) == 2 and
+                    ind1shp is not None and len(ind1shp) == 1 and
+                    ind2shp is not None and len(ind2shp) == 1):
                 # if the graph is correct, we can assume ind1shp[0] and
                 # ind2shp[0] will have the same value.
                 # Try to return the one closest to the graph input.

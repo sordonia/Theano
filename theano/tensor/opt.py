@@ -1171,14 +1171,22 @@ class ShapeFeature(object):
                     self.set_shape_i(v, ii, new_r)
         self.shape_of_reverse_index[r] = set()
 
-    def same_shape(self, x, y):
+    def same_shape(self, x, y, dim_x=None, dim_y=None):
         """Return True if we are able to assert that x and y have the
-        same shape
+        same shape.
+
+        dim_x and dim_y are optional. If used, they should be an index
+        to compare only 1 shape of x or y.
+
         """
         sx = self.shape_of[x]
         sy = self.shape_of[y]
         if sx is None or sy is None:
             return False
+        if dim_x is not None:
+            sx = [sx[dim_x]]
+        if dim_y is not None:
+            sy = [sy[dim_y]]
         assert len(sx) == len(sy)
 
         for dx, dy in zip(sx, sy):
@@ -1449,6 +1457,29 @@ def local_alloc_unary(node):
             return [T.alloc(T.cast(v, node.outputs[0].dtype), *shp)]
 
 
+@register_canonicalize
+@register_specialize
+@gof.local_optimizer([T.Elemwise])
+def local_cast_cast(node):
+    """cast(cast(x, dtype1), dtype2)
+
+    when those contrain:
+    dtype1 == dtype2
+    TODO: the base dtype is the same (int, uint, float, complex)
+          and the first cast cause an upcast.
+    """
+    if (not isinstance(node.op, T.Elemwise) or
+        not isinstance(node.op.scalar_op, scalar.Cast)):
+        return
+    x = node.inputs[0]
+    if (not x.owner or
+        not isinstance(x.owner.op, T.Elemwise) or
+        not isinstance(x.owner.op.scalar_op, scalar.Cast)):
+        return
+    if node.op.scalar_op.o_type == x.owner.op.scalar_op.o_type:
+        return [x]
+
+
 class Assert(T.Op):
     """
     Implements assertion in a computational graph.
@@ -1551,9 +1582,32 @@ def local_remove_useless_assert(node):
             return [assert_(node.inputs[0], *cond)]
 
 
-@register_specialize
+@gof.local_optimizer([Assert])
+def local_remove_all_assert(node):
+    """An optimization disabled by default that removes all asserts from
+    the graph.
+
+    :note: See the :ref:`unsafe` section to know how to enable it.
+
+    """
+    if not isinstance(node.op, Assert):
+        return
+
+    return [node.inputs[0]]
+# Disabled by default
+compile.optdb['canonicalize'].register('local_remove_all_assert',
+                                       local_remove_all_assert,
+                                       use_db_name_as_tag=False)
+compile.optdb['stabilize'].register('local_remove_all_assert',
+                                    local_remove_all_assert,
+                                    use_db_name_as_tag=False)
+compile.optdb['specialize'].register('local_remove_all_assert',
+                                     local_remove_all_assert,
+                                     use_db_name_as_tag=False)
+
+@register_specialize("local_alloc_elemwise")
 @gof.local_optimizer([T.Elemwise])
-def local_alloc_elemwise(node):
+def local_elemwise_alloc(node):
     """
     elemwise(alloc(x, shp), ..., y.TensorType(BROADCAST CONDITION))
       -> elemwise(x, y.TensorType(BROADCAST CONDITION))
@@ -1692,12 +1746,14 @@ theano.configparser.AddConfigVar('experimental.local_alloc_elemwise',
                                      is_valid=lambda x: x
                                  ),
                                  in_c_key=False)
-#This version if faster but not as safe.
-theano.configparser.AddConfigVar('experimental.local_alloc_elemwise_assert',
-        "If False enable the experimental optimization local_alloc_elemwise"
-                                 " but WITHOUT assert into the graph!",
-        theano.configparser.BoolParam(True),
-        in_c_key=False)
+
+# False could make the graph faster but not as safe.
+theano.configparser.AddConfigVar(
+    'experimental.local_alloc_elemwise_assert',
+    "When the local_alloc_elemwise is applied, add"
+    " an assert to highlight shape errors.",
+    theano.configparser.BoolParam(True),
+    in_c_key=False)
 
 ############################
 # Constant Canonicalization
@@ -2462,6 +2518,48 @@ def local_setsubtensor_of_constants(node):
             return False
 
 
+@register_canonicalize
+@register_stabilize
+@gof.local_optimizer([AdvancedSubtensor1])
+def local_adv_sub1_adv_inc_sub1(node):
+    """Optimize the possible AdvSub1(AdvIncSub1(...), ...)
+
+    AdvancedSubtensor1(AdvancedIncSubtensor1(0s, y, idx), idx) -> y
+    AdvancedSubtensor1(AdvancedSetSubtensor1(x, y, idx), idx) -> y
+
+    :note: This opt add AssertOp. Otherwise, it would remove shape and
+        index error. If you want to get rid of them, see the
+        :ref:`unsafe_optimization` section.
+
+    """
+    if not isinstance(node.op, AdvancedSubtensor1):
+        return
+    inp = node.inputs[0]
+    if (not inp.owner or
+        not isinstance(inp.owner.op, AdvancedIncSubtensor1)):
+        return
+    idx = node.inputs[1]
+    idx2 = inp.owner.inputs[2]
+    x = inp.owner.inputs[0]
+    y = inp.owner.inputs[1]
+    if idx is not idx2:
+        return
+    if (not inp.owner.op.set_instead_of_inc and
+        T.extract_constant(x) != 0):
+        return
+    cond = [T.all(T.and_(T.lt(idx, x.shape[0]),
+                        T.ge(idx, -x.shape[0])))]
+    if not node.fgraph.shape_feature.same_shape(idx, y, 0, 0):
+        cond.append(T.eq(idx.shape[0], y.shape[0]))
+    y = Assert("Bad indexing or shapes in a AdvancedIncSubtensor1 that was optimized away")(y, *cond)
+
+    if y.dtype == node.outputs[0].dtype:
+        return [y]
+    # It is possible that y is upcast or downcast to x.dtype.
+    # In all case, as we set or add with 0, we can just cast y.
+    return [T.cast(y, node.outputs[0].dtype)]
+
+
 ####################
 # Rebroadcast opts #
 ####################
@@ -2571,6 +2669,77 @@ def local_join_1(node):
     tensors = node.inputs[1:]
     if len(tensors) == 1:
         return [tensors[0]]
+
+
+@register_specialize
+@register_canonicalize
+@gof.local_optimizer([T.Join])
+def local_join_empty(node):
+    """Join(i, x, y, empty) => Join(i, x, y)
+
+    remove empty inputs to joins. The empty inputs can be anywhere.
+    """
+    if not isinstance(node.op, T.Join):
+        return
+    new_inputs = []
+    try:
+        join_idx = get_scalar_constant_value(node.inputs[0])
+    except NotScalarConstantError:
+        return
+    for idx in range(1, len(node.inputs)):
+        inp = node.inputs[idx]
+        # We can not use size == 0,, as this can change shape from 3,0
+        # to 2,0.  This trigger DebugMode error. This happen with
+        # stack(...,[]) as this add a dimshuffle on [], that add a
+        # dimensions with shape 1.
+        if isinstance(inp, theano.Constant) and inp.data.shape[join_idx] == 0:
+            continue
+        new_inputs.append(inp)
+    if len(new_inputs) < len(node.inputs) - 1:
+        if len(new_inputs) == 0:
+            # T.join do not work in that case.
+            # constant folding will take care of this case.
+            return
+        ret = T.join(node.inputs[0], *new_inputs)
+        o = node.outputs[0]
+        if ret.dtype != o.dtype:
+            # Join can upcast some inputs
+            return
+        if ret.type != o.type:
+            assert ret.dtype == o.dtype
+            assert ret.ndim == o.ndim
+            ret = T.patternbroadcast(ret, node.outputs[0].broadcastable)
+        return [ret]
+
+
+@register_specialize
+@register_canonicalize
+@gof.local_optimizer([T.Join])
+def local_join_make_vector(node):
+    """Join(0, make_vector1, make_vector2, ...) => Join(0, make_vector12, ...)
+
+    Merge MakeVector inputs to Join. This can make the join completly
+    disapear with the local_join_1 opt.
+
+    """
+    if not isinstance(node.op, T.Join) or node.outputs[0].ndim != 1:
+        return
+    new_inputs = [node.inputs[1]]
+    for idx in range(2, len(node.inputs)):
+        inp = node.inputs[idx]
+        if (inp.owner and
+            isinstance(inp.owner.op, MakeVector) and
+            new_inputs[-1].owner and
+            isinstance(new_inputs[-1].owner.op, MakeVector) and
+            # MakeVector have a dtype parameter
+            inp.owner.op == new_inputs[-1].owner.op):
+            inps = new_inputs[-1].owner.inputs + inp.owner.inputs
+            new_inputs[-1] = inp.owner.op(*inps)
+        else:
+            new_inputs.append(inp)
+    if len(new_inputs) < len(node.inputs) - 1:
+        ret = T.join(node.inputs[0], *new_inputs)
+        return [ret]
 
 
 ###############
@@ -4221,6 +4390,11 @@ def local_log_add(node):
         z = node.inputs[0]
         if z.owner and z.owner.op == T.add:
             zi = z.owner.inputs
+            if len(zi) != 2:
+                # -- upgrading Maximum to handle multiple inputs wasn't trivial
+                #    TODO
+                #raise NotImplementedError()
+                return
             pre_exp = [x.owner.inputs[0] for x in zi
                        if x.owner and x.owner.op == T.exp]
             if len(pre_exp) == len(zi):
@@ -4415,9 +4589,21 @@ def constant_folding(node):
     for o in node.outputs:
         storage_map[o] = [None]
         compute_map[o] = [False]
+    if (hasattr(node.op, 'python_constant_folding') and
+        node.op.python_constant_folding(node)):
 
-    thunk = node.op.make_thunk(node, storage_map, compute_map,
-            no_recycling=[])
+        old_value = getattr(node.op, '_op_use_c_code', False)
+        try:
+            node.op._op_use_c_code = False
+            thunk = node.op.make_thunk(node,
+                                       storage_map,
+                                       compute_map,
+                                       [])
+        finally:
+            node.op._op_use_c_code = old_value
+    else:
+        thunk = node.op.make_thunk(node, storage_map, compute_map,
+                                   no_recycling=[])
 
     required = thunk()
     assert not required  # a node whose inputs are all provided should always
